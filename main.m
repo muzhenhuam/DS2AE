@@ -24,20 +24,65 @@ mask=double(map);
 [m,n,b]=size(data);
 N=m*n;
 dat=normalize(data);
-
-% [H,W,Dim]=size(DataTest);
-% num=H*W;
-% windowSize = 3; % 定义窗口大小
-% for i=1:b
-%     DataTest(:,:,i) = calculateLocalEntropy(dat(:,:,i), windowSize);
-% end
-% Date = reshape(DataTest,N,b)';
 Date = reshape(dat,N,b)';
-% Extract EMs from each class
+%% 空间中心化（Spatial Centering）
+% 计算每个波段的均值
+mean_bands = mean(mean(dat, 1), 2);  % [1,1,b]
+% 全局中心化：消除跨波段亮度变化
+centered_cube = dat - mean_bands;     % [m,n,b]
 
-%%1
-% 预处理
-Date2 = pre(Date);
+%%空间平滑（3x3均值滤波）
+smoothed_cube = zeros(size(centered_cube));
+for bb = 1:b
+    smoothed_cube(:,:,bb) = conv2(centered_cube(:,:,bb), ones(3)/9, 'same');
+end
+
+window_size = 7;  % 局部窗口大小 (2k+1, k=3)
+epsilon = 1e-10;
+
+% 计算每个波段的信息熵用于自适应alpha
+entropy_per_band = zeros(b,1);
+for bb = 1:b
+    band_data = dat(:,:,bb);
+    % 计算熵
+    p = band_data(:) / sum(band_data(:));
+    p = p(p > 0);  % 避免log(0)
+    entropy_per_band(bb) = -sum(p .* log2(p + epsilon));
+end
+
+% 自适应alpha
+alpha_adaptive = 1 + (entropy_per_band - min(entropy_per_band)) ./ (range(entropy_per_band) + epsilon);
+
+% LCS增强
+enhanced_cube = zeros(size(dat));
+for bb = 1:b
+    band_data = dat(:,:,bb);
+    
+    % 计算局部统计量 (2k+1窗口)
+    local_mean = imfilter(band_data, fspecial('average', window_size), 'replicate');
+    local_var = imfilter(band_data.^2, fspecial('average', window_size), 'replicate') - local_mean.^2;
+    local_std = sqrt(max(local_var, 0)) + epsilon;
+    
+    % LCS公式: h_L = alpha * (h - mu) / (sigma + eps) + beta
+    % beta设为0保持背景稳定
+    enhanced_cube(:,:,bb) = alpha_adaptive(bb) * (band_data - local_mean) ./ local_std;
+end
+
+% 计算SNR
+snr_pre = estimate_snr(smoothed_cube);
+snr_lcs = estimate_snr(enhanced_cube);
+
+% 融合权重
+gamma = snr_pre / (snr_pre + snr_lcs);
+Date_pre = reshape(smoothed_cube, N, b)';  % [b, N]
+Date_lcs = reshape(enhanced_cube, N, b)';  % [b, N]
+
+% 融合后的数据
+Date_fused = gamma * Date_pre + (1 - gamma) * Date_lcs;
+Date_fused = normalize(reshape(Date_fused', m, n, b));
+Date1=Date_fused;
+Date1=normalize(Date1);
+Date2 = reshape(Date1,N,b)';
 
 
 P = 3;
@@ -73,14 +118,11 @@ rngflag=1;
 disp('run MAC-U...') 
 
 tic
-[output,a_NNHU1,W,MLP1,rmse_r_NNHU1] = NNHU_autoencoder_customize_1(Date,M,lambda1,lambda2,lambda3,lambda5,lambda6,learnRate,numEpochs,rngflag);
-[output2,a_NNHU2,W2,MLP2,rmse_r_NNHU2] = NNHU_autoencoder_customize_1(Date2,M2,lambda1,lambda2,lambda3,lambda5,lambda6,learnRate,numEpochs,rngflag);
+[output,a_NNHU1,W,MLP1,rmse_r_NNHU1] = NNHU(Date,M,lambda1,lambda2,lambda3,lambda5,lambda6,learnRate,numEpochs,rngflag);
+[output2,a_NNHU2,W2,MLP2,rmse_r_NNHU2] = NNHU(Date2,M2,lambda1,lambda2,lambda3,lambda5,lambda6,learnRate,numEpochs,rngflag);
 time_NNHU1 = toc;
 
 res = double(reshape(output,m,n,b));
-% figure;imshow(res(:,:,100),[]);
-% figure;imshow(data(:,:,100),[]);
-% figure;imshow(mask,[]);
 % err2=(dat-res).^2;
 err2=res.^2;
 gae=mat2gray(sum(err2,3));
@@ -93,23 +135,11 @@ err22=res2.^2;
 % gae2=RXfunc(err22);
 gae2=mat2gray(sum(err22,3));
 
-gae3=fusion(gae,gae2);  
+gae3=0.9*gae+0.1*gae2;   %SA 0.99 0.01
 
 % toc;
 det_map=reshape(gae3,N,1);
 GT=reshape(mask,N,1);
 mode_eq=1;
 [AUC_D_F,AUC_D_tau,AUC_F_tau,AUC_TD,AUC_BS,AUC_SNPR,AUC_TDBS,AUC_ODP]=plot_3DROC(det_map,GT,mode_eq);
-%%
-RR=gae3;
-figure
-imagesc(RR)
-[r,c] = size(RR);
-axis image %这里是使图像以原比例显示
-set(gca,'XTick',[],'YTick',[])%去掉横纵坐标的刻度线
-set(gca,'Position',[0 0 1 1])%让图像充满整个图窗
-set(gcf,'Position',[300 300 400 400]);%消除白边
-set(gcf,'innerposition',[100,500,c,r])%让图像充满整个图窗
-EUF1=RR;
-saveas(gca,'EUF.bmp')%保存图像
-save EUF EUF1
+
